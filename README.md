@@ -1,69 +1,95 @@
+# ClearCtrl
 
+ClearCtrl is a RocksDB compaction tuning prototype.
 
-We use RocksDB v10.10.1 (official signed release).
+## Environment
 
-environment:
-google cloud n2-standard-8 (8 vCPU, 32 GB DRAM)
+- RocksDB: `v10.10.1`
+- Example machine: Google Cloud `n2-standard-8` (8 vCPU, 32 GB RAM)
 
+## Build RocksDB (Static Library)
+
+From `../rocksdb`:
+
+```sh
 apt install -y libgflags-dev
-
 make -j2 static_lib PORTABLE=1 DISABLE_WARNING_AS_ERROR=1
+```
 
+Optional benchmark binary:
+
+```sh
 make -j2 db_bench DEBUG_LEVEL=0 LIB_MODE=static DISABLE_WARNING_AS_ERROR=1
-
-The user passes a `rocksdb::DB*` pointer to your controller module, and you launch a background thread to perform periodic monitoring and parameter tuning.
-More precisely, however, you are monitoring RocksDB's internal state.
-
-We provide a controller library. After creating and opening a RocksDB DB instance, the user passes the `DB*` pointer to the controller. The controller then launches a background thread to periodically read RocksDB's internal state and dynamically adjust compaction-related parameters via the runtime options API.
-
-First, verify two things:
-
-1. Which metrics can be read via the API?
-
-2. Which parameters can be modified at runtime via the API?
-
-These two factors determine whether your controller can operate as a closed-loop system.
-
-In other words, your next step should be to:
-
-Compile a table of "observable metrics / controllable knobs."
-
-user thread:
-```cpp
-rocksdb::DB* db;
-rocksdb::DB::Open(..., &db);
-db->Put(...);
-db->Get(...);
-
-CompactionController ctl(db);
-ctl.Start();
 ```
 
-our thread:
-```cpp
-while (true) {
-    auto stall = get_stall();
-    auto backlog = get_l0_files();
-
-    if (stall > threshold) {
-        db->SetOptions({{"max_background_jobs", "4"}});
-    } else {
-        db->SetOptions({{"max_background_jobs", "2"}});
-    }
-
-    sleep(5);
-}
-```
-
-build:
+## Build ClearCtrl
 
 ```sh
 cmake -S . -B build
 cmake --build build -j$(nproc)
 ```
 
-run:
+Binary:
+
+- `./build/clearctrl_bench`
+
+## Run
+
+Show all options:
 
 ```sh
-./build/clearctrl_test -h
+./build/clearctrl_bench -h
 ```
+
+Example fixed run:
+
+```sh
+./build/clearctrl_bench \
+  --controller=off \
+  --rounds=500 \
+  --rocksdb-max-background-jobs=6 \
+  --rocksdb-increase-parallelism=6 \
+  --log-path=logs/fixed6-500r.csv
+```
+
+## Reproducible Test Workflow
+
+Run all 4 workloads (fixed2/fixed4/fixed6/controller) and save console output:
+
+```sh
+sh ./test.sh 2>&1 | tee logs/test.log
+```
+
+Analyze logs:
+
+```sh
+python analyze_logs.py \
+  logs/fixed2-500r.csv \
+  logs/fixed4-500r.csv \
+  logs/fixed6-500r.csv \
+  logs/controller-500r.csv
+```
+
+Analysis outputs:
+
+- `analysis/summary.csv`
+- `analysis/controller_switches.csv`
+- `analysis/controller_by_bg_jobs.csv`
+- `analysis/controller_vs_baselines_pct.csv`
+
+## Current Logged Fields
+
+Per-round CSV columns:
+
+- `run_id`
+- `timestamp`
+- `l0_files`
+- `stall_micros_total`
+- `stall_micros_delta`
+- `compaction_pending_bytes`
+- `is_write_stopped`
+- `actual_delayed_write_rate`
+- `num_running_compactions`
+- `batch_payload_bytes`
+- `batch_latency_ms`
+- `bg_jobs`

@@ -9,7 +9,7 @@ import pandas as pd
 
 REQUIRED_COLUMNS = {
     "batch_latency_ms",
-    "write_throughput_mb_s",
+    "batch_payload_bytes",
     "stall_micros_total",
     "stall_micros_delta",
     "bg_jobs",
@@ -38,9 +38,18 @@ def load_csv(path: Path) -> pd.DataFrame:
     return df
 
 
+def compute_overall_throughput_mb_s(df: pd.DataFrame) -> float:
+    total_payload_bytes = float(df["batch_payload_bytes"].sum())
+    total_latency_ms = float(df["batch_latency_ms"].sum())
+    if total_latency_ms <= 0.0:
+        return 0.0
+    total_payload_mb = total_payload_bytes / (1024.0 * 1024.0)
+    return total_payload_mb / (total_latency_ms / 1000.0)
+
+
 def compute_summary(config: str, df: pd.DataFrame) -> Dict[str, float]:
     lat = df["batch_latency_ms"]
-    tp = df["write_throughput_mb_s"]
+    overall_tp = compute_overall_throughput_mb_s(df)
     stall_total_s = float(df["stall_micros_total"].max()) / 1e6
 
     return {
@@ -49,7 +58,7 @@ def compute_summary(config: str, df: pd.DataFrame) -> Dict[str, float]:
         "p95_latency_ms": float(lat.quantile(0.95)),
         "p99_latency_ms": float(lat.quantile(0.99)),
         "max_latency_ms": float(lat.max()),
-        "mean_throughput_mb_s": float(tp.mean()),
+        "overall_throughput_mb_s": overall_tp,
         "total_stall_s": stall_total_s,
         "rows": int(len(df)),
     }
@@ -68,27 +77,30 @@ def controller_switch_analysis(df: pd.DataFrame) -> pd.DataFrame:
             "bg_jobs",
             "l0_files",
             "stall_micros_total",
+            "batch_payload_bytes",
             "batch_latency_ms",
-            "write_throughput_mb_s",
         ]
     ]
 
 
 def controller_by_bg_jobs(df: pd.DataFrame) -> pd.DataFrame:
-    grouped = (
-        df.groupby("bg_jobs", dropna=False)
-        .agg(
-            rounds=("bg_jobs", "size"),
-            mean_latency_ms=("batch_latency_ms", "mean"),
-            p95_latency_ms=("batch_latency_ms", lambda s: s.quantile(0.95)),
-            p99_latency_ms=("batch_latency_ms", lambda s: s.quantile(0.99)),
-            mean_throughput_mb_s=("write_throughput_mb_s", "mean"),
-            mean_l0=("l0_files", "mean"),
-            stall_delta_sum_s=("stall_micros_delta", lambda s: s.sum() / 1e6),
+    rows = []
+    for bg_jobs, group in df.groupby("bg_jobs", dropna=False):
+        rows.append(
+            {
+                "bg_jobs": bg_jobs,
+                "rounds": int(len(group)),
+                "mean_latency_ms": float(group["batch_latency_ms"].mean()),
+                "p95_latency_ms": float(group["batch_latency_ms"].quantile(0.95)),
+                "p99_latency_ms": float(group["batch_latency_ms"].quantile(0.99)),
+                "overall_throughput_mb_s": compute_overall_throughput_mb_s(group),
+                "mean_l0": float(group["l0_files"].mean()),
+                "stall_delta_sum_s": float(group["stall_micros_delta"].sum()) / 1e6,
+            }
         )
-        .reset_index()
-    )
-    return grouped.sort_values("bg_jobs")
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("bg_jobs")
 
 
 def compare_controller_vs_baselines(summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -105,7 +117,7 @@ def compare_controller_vs_baselines(summary_df: pd.DataFrame) -> pd.DataFrame:
         "p95_latency_ms",
         "p99_latency_ms",
         "max_latency_ms",
-        "mean_throughput_mb_s",
+        "overall_throughput_mb_s",
         "total_stall_s",
     ]
 

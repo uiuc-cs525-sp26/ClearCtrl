@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    const std::string kDBPath = "./testdb";
+    const std::string DB_PATH = "./testdb";
     bool controller_enabled = DEFAULT_CONTROLLER_ENABLED;
     uint64_t max_rounds = DEFAULT_ROUNDS;
     uint64_t runner_sleep_ms = DEFAULT_RUNNER_SLEEP_MS;
@@ -490,7 +490,7 @@ int main(int argc, char** argv) {
     options.level0_stop_writes_trigger = rocksdb_l0_stop_trigger;
 
     DB* db = nullptr;
-    Status s = DB::Open(options, kDBPath, &db);
+    Status s = DB::Open(options, DB_PATH, &db);
     if (!s.ok()) {
         std::cerr << "Open DB failed: " << s.ToString() << std::endl;
         return 1;
@@ -533,7 +533,7 @@ int main(int argc, char** argv) {
     if (log.is_open()) {
         log << "run_id,timestamp,l0_files,stall_micros_total,stall_micros_delta,"
                "compaction_pending_bytes,is_write_stopped,actual_delayed_write_rate,"
-               "num_running_compactions,write_throughput_mb_s,batch_latency_ms,bg_jobs\n";
+               "num_running_compactions,batch_payload_bytes,batch_latency_ms,bg_jobs\n";
     }
 
     // 前台 workload：持续写入，推动 flush/L0/compaction 发生
@@ -572,12 +572,6 @@ int main(int argc, char** argv) {
             std::chrono::system_clock::now().time_since_epoch()).count();
         double batch_latency_ms = std::chrono::duration<double, std::milli>(
             write_end - write_begin).count();
-        double write_throughput_mb_s = 0.0;
-        if (batch_latency_ms > 0.0) {
-            write_throughput_mb_s =
-                (static_cast<double>(batch_payload_bytes) / (1024.0 * 1024.0)) /
-                (batch_latency_ms / 1000.0);
-        }
         int bg_jobs = controller_enabled ? ctl.CurrentBgJobs() : rocksdb_max_background_jobs;
 
         if (log.is_open()) {
@@ -590,7 +584,7 @@ int main(int argc, char** argv) {
                 << is_write_stopped << ","
                 << actual_delayed_write_rate << ","
                 << num_running_compactions << ","
-                << write_throughput_mb_s << ","
+                << batch_payload_bytes << ","
                 << batch_latency_ms << ","
                 << bg_jobs << "\n";
             log.flush();
@@ -608,6 +602,14 @@ int main(int argc, char** argv) {
     Status close_status = db->Close();
     if (!close_status.ok()) {
         std::cerr << "Close failed: " << close_status.ToString() << std::endl;
+        return 1;
+    }
+    db_guard.reset();
+
+    Status destroy_status = DestroyDB(DB_PATH, options);
+    if (!destroy_status.ok()) {
+        std::cerr << "DestroyDB failed: " << destroy_status.ToString()
+                  << std::endl;
         return 1;
     }
 
