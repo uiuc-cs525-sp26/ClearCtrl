@@ -3,7 +3,7 @@
 We use RocksDB v10.10.1 (official signed release).
 
 environment:
-google cloud n2-standard-2 (2 vCPU, 8 GB)
+google cloud n2-standard-8 (8 vCPU, 32 GB DRAM)
 
 apt install -y libgflags-dev
 
@@ -65,9 +65,5 @@ cmake --build build -j$(nproc)
 run:
 
 ```sh
-./build/clearctrl_test 
- --controller=on|off   Enable/disable dynamic controller (default: on)
-  --rounds=N            Number of write rounds; 0 means run until Ctrl+C (default: 0)
-  --log-path=FILE       Output CSV path (default: metrics.csv)
-  -h, --help            Show help
+./build/clearctrl_test -h
 ```

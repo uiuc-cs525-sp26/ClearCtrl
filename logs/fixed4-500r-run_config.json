@@ -1,16 +1,17 @@
 {
-  "run_id": "1774960591593",
+  "run_id": "1775039943358",
   "runner": {
     "controller": "off",
     "rounds": 500,
-    "sleep_ms": 10,
+    "sleep_ms": 100,
     "batch_ops": 4000,
     "log_path": "logs/fixed4-500r.csv"
   },
   "rocksdb": {
-    "increase_parallelism": 4,
+    "increase_parallelism": 6,
+    "increase_parallelism_mode": "manual",
     "max_background_jobs": 4,
-    "write_buffer_size_mb": 1,
+    "write_buffer_size_mb": 4,
     "l0_compaction_trigger": 8,
     "l0_slowdown_trigger": 12,
     "l0_stop_trigger": 16

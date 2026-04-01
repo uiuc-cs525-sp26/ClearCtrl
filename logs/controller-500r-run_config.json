@@ -1,5 +1,5 @@
 {
-  "run_id": "1774963559197",
+  "run_id": "1775040096824",
   "runner": {
     "controller": "on",
     "rounds": 500,
@@ -9,6 +9,7 @@
   },
   "rocksdb": {
     "increase_parallelism": 6,
+    "increase_parallelism_mode": "auto",
     "max_background_jobs": 2,
     "write_buffer_size_mb": 4,
     "l0_compaction_trigger": 8,

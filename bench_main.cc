@@ -20,29 +20,63 @@ using namespace ROCKSDB_NAMESPACE;
 
 static std::atomic<bool> g_stop{false};
 
+constexpr bool DEFAULT_CONTROLLER_ENABLED = true;
+constexpr uint64_t DEFAULT_ROUNDS = 0;
+constexpr uint64_t DEFAULT_RUNNER_SLEEP_MS = 100;
+constexpr uint64_t DEFAULT_RUNNER_BATCH_OPS = 4000;
+constexpr int DEFAULT_ROCKSDB_MAX_BACKGROUND_JOBS = 2;
+constexpr uint64_t DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE_MB = 4;
+constexpr int DEFAULT_ROCKSDB_L0_COMPACTION_TRIGGER = 8;
+constexpr int DEFAULT_ROCKSDB_L0_SLOWDOWN_TRIGGER = 12;
+constexpr int DEFAULT_ROCKSDB_L0_STOP_TRIGGER = 16;
+constexpr int DEFAULT_CTRL_LOW_THRESHOLD = 4;
+constexpr int DEFAULT_CTRL_HIGH_THRESHOLD = 10;
+constexpr int DEFAULT_CTRL_LOW_BG_JOBS = 2;
+constexpr int DEFAULT_CTRL_HIGH_BG_JOBS = 6;
+constexpr int DEFAULT_CTRL_INTERVAL_SEC = 2;
+constexpr int DEFAULT_CTRL_COOLDOWN_SEC = 6;
+constexpr const char* DEFAULT_LOG_PATH_PATTERN = "logs/metrics_<run_id>.csv";
+
 void PrintUsage(const char* prog) {
     std::cout
         << "Usage: " << prog << " [runner options] [rocksdb options] [ctrl options]\n"
         << "Runner options:\n"
-        << "  --controller=on|off                 Enable/disable dynamic controller (default: on)\n"
-        << "  --rounds=N                          Number of write rounds; 0 means run until Ctrl+C (default: 0)\n"
-        << "  --runner-sleep-ms=N                 Sleep interval between write rounds in ms (default: 100)\n"
-        << "  --runner-batch-ops=N                Number of Put ops per round (default: 1000)\n"
-        << "  --log-path=FILE                     Output CSV path (default: logs/metrics_<run_id>.csv)\n"
+        << "  --controller=on|off                 Enable/disable dynamic controller (default: "
+        << (DEFAULT_CONTROLLER_ENABLED ? "on" : "off") << ")\n"
+        << "  --rounds=N                          Number of write rounds; 0 means run until Ctrl+C (default: "
+        << DEFAULT_ROUNDS << ")\n"
+        << "  --runner-sleep-ms=N                 Sleep interval between write rounds in ms (default: "
+        << DEFAULT_RUNNER_SLEEP_MS << ")\n"
+        << "  --runner-batch-ops=N                Number of Put ops per round (default: "
+        << DEFAULT_RUNNER_BATCH_OPS << ")\n"
+        << "  --log-path=FILE                     Output CSV path (default: "
+        << DEFAULT_LOG_PATH_PATTERN << ")\n"
         << "  --run-id=ID                         Explicit run id (default: auto timestamp)\n"
         << "RocksDB options:\n"
-        << "  --rocksdb-max-background-jobs=N     Initial max_background_jobs at startup (default: 2)\n"
-        << "  --rocksdb-write-buffer-size-mb=N    write_buffer_size in MiB (default: 4)\n"
-        << "  --rocksdb-l0-compaction-trigger=N   level0_file_num_compaction_trigger (default: 8)\n"
-        << "  --rocksdb-l0-slowdown-trigger=N     level0_slowdown_writes_trigger (default: 12)\n"
-        << "  --rocksdb-l0-stop-trigger=N         level0_stop_writes_trigger (default: 16)\n"
+        << "  --rocksdb-max-background-jobs=N     Initial max_background_jobs at startup (default: "
+        << DEFAULT_ROCKSDB_MAX_BACKGROUND_JOBS << ")\n"
+        << "  --rocksdb-increase-parallelism=N    Override IncreaseParallelism thread count (default: auto: controller?ctrl_high_bg_jobs:rocksdb_max_background_jobs)\n"
+        << "  --rocksdb-write-buffer-size-mb=N    write_buffer_size in MiB (default: "
+        << DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE_MB << ")\n"
+        << "  --rocksdb-l0-compaction-trigger=N   level0_file_num_compaction_trigger (default: "
+        << DEFAULT_ROCKSDB_L0_COMPACTION_TRIGGER << ")\n"
+        << "  --rocksdb-l0-slowdown-trigger=N     level0_slowdown_writes_trigger (default: "
+        << DEFAULT_ROCKSDB_L0_SLOWDOWN_TRIGGER << ")\n"
+        << "  --rocksdb-l0-stop-trigger=N         level0_stop_writes_trigger (default: "
+        << DEFAULT_ROCKSDB_L0_STOP_TRIGGER << ")\n"
         << "ClearCtrl options:\n"
-        << "  --ctrl-low-threshold=N              Hysteresis low threshold (default: 4)\n"
-        << "  --ctrl-high-threshold=N             Hysteresis high threshold (default: 10)\n"
-        << "  --ctrl-low-bg-jobs=N                Low max_background_jobs (default: 2)\n"
-        << "  --ctrl-high-bg-jobs=N               High max_background_jobs (default: 6)\n"
-        << "  --ctrl-interval-sec=N               Control interval seconds (default: 2)\n"
-        << "  --ctrl-cooldown-sec=N               Switch cooldown seconds (default: 6)\n"
+        << "  --ctrl-low-threshold=N              Hysteresis low threshold (default: "
+        << DEFAULT_CTRL_LOW_THRESHOLD << ")\n"
+        << "  --ctrl-high-threshold=N             Hysteresis high threshold (default: "
+        << DEFAULT_CTRL_HIGH_THRESHOLD << ")\n"
+        << "  --ctrl-low-bg-jobs=N                Low max_background_jobs (default: "
+        << DEFAULT_CTRL_LOW_BG_JOBS << ")\n"
+        << "  --ctrl-high-bg-jobs=N               High max_background_jobs (default: "
+        << DEFAULT_CTRL_HIGH_BG_JOBS << ")\n"
+        << "  --ctrl-interval-sec=N               Control interval seconds (default: "
+        << DEFAULT_CTRL_INTERVAL_SEC << ")\n"
+        << "  --ctrl-cooldown-sec=N               Switch cooldown seconds (default: "
+        << DEFAULT_CTRL_COOLDOWN_SEC << ")\n"
         << "  -h, --help            Show help\n";
 }
 
@@ -116,25 +150,26 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
 
     const std::string kDBPath = "./testdb";
-    bool controller_enabled = true;
-    uint64_t max_rounds = 0;
-    uint64_t runner_sleep_ms = 100;
-    uint64_t runner_batch_ops = 1000;
+    bool controller_enabled = DEFAULT_CONTROLLER_ENABLED;
+    uint64_t max_rounds = DEFAULT_ROUNDS;
+    uint64_t runner_sleep_ms = DEFAULT_RUNNER_SLEEP_MS;
+    uint64_t runner_batch_ops = DEFAULT_RUNNER_BATCH_OPS;
     std::string log_path;
     std::string run_id;
 
-    int rocksdb_max_background_jobs = 2;
-    uint64_t rocksdb_write_buffer_size_mb = 4;
-    int rocksdb_l0_compaction_trigger = 8;
-    int rocksdb_l0_slowdown_trigger = 12;
-    int rocksdb_l0_stop_trigger = 16;
+    int rocksdb_max_background_jobs = DEFAULT_ROCKSDB_MAX_BACKGROUND_JOBS;
+    int rocksdb_increase_parallelism_override = 0;  // 0 means auto
+    uint64_t rocksdb_write_buffer_size_mb = DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE_MB;
+    int rocksdb_l0_compaction_trigger = DEFAULT_ROCKSDB_L0_COMPACTION_TRIGGER;
+    int rocksdb_l0_slowdown_trigger = DEFAULT_ROCKSDB_L0_SLOWDOWN_TRIGGER;
+    int rocksdb_l0_stop_trigger = DEFAULT_ROCKSDB_L0_STOP_TRIGGER;
 
-    int ctrl_low_threshold = 4;
-    int ctrl_high_threshold = 10;
-    int ctrl_low_bg_jobs = 2;
-    int ctrl_high_bg_jobs = 6;
-    int ctrl_interval_sec = 2;
-    int ctrl_cooldown_sec = 6;
+    int ctrl_low_threshold = DEFAULT_CTRL_LOW_THRESHOLD;
+    int ctrl_high_threshold = DEFAULT_CTRL_HIGH_THRESHOLD;
+    int ctrl_low_bg_jobs = DEFAULT_CTRL_LOW_BG_JOBS;
+    int ctrl_high_bg_jobs = DEFAULT_CTRL_HIGH_BG_JOBS;
+    int ctrl_interval_sec = DEFAULT_CTRL_INTERVAL_SEC;
+    int ctrl_cooldown_sec = DEFAULT_CTRL_COOLDOWN_SEC;
 
     enum OptionId {
         OPT_CONTROLLER = 1000,
@@ -144,6 +179,7 @@ int main(int argc, char** argv) {
         OPT_LOG_PATH,
         OPT_RUN_ID,
         OPT_RDB_MAX_BACKGROUND_JOBS,
+        OPT_RDB_INCREASE_PARALLELISM,
         OPT_RDB_WRITE_BUFFER_SIZE_MB,
         OPT_RDB_L0_COMPACTION_TRIGGER,
         OPT_RDB_L0_SLOWDOWN_TRIGGER,
@@ -165,6 +201,8 @@ int main(int argc, char** argv) {
         {"run-id", required_argument, nullptr, OPT_RUN_ID},
         {"rocksdb-max-background-jobs", required_argument, nullptr,
          OPT_RDB_MAX_BACKGROUND_JOBS},
+        {"rocksdb-increase-parallelism", required_argument, nullptr,
+         OPT_RDB_INCREASE_PARALLELISM},
         {"rocksdb-write-buffer-size-mb", required_argument, nullptr,
          OPT_RDB_WRITE_BUFFER_SIZE_MB},
         {"rocksdb-l0-compaction-trigger", required_argument, nullptr,
@@ -250,6 +288,13 @@ int main(int argc, char** argv) {
             case OPT_RDB_MAX_BACKGROUND_JOBS:
                 if (!parse_int_arg("--rocksdb-max-background-jobs", optarg,
                                    &rocksdb_max_background_jobs)) {
+                    PrintUsage(argv[0]);
+                    return 1;
+                }
+                break;
+            case OPT_RDB_INCREASE_PARALLELISM:
+                if (!parse_int_arg("--rocksdb-increase-parallelism", optarg,
+                                   &rocksdb_increase_parallelism_override)) {
                     PrintUsage(argv[0]);
                     return 1;
                 }
@@ -356,8 +401,10 @@ int main(int argc, char** argv) {
     }
     std::filesystem::path run_config_path =
         log_dir / (config_stem + "-run_config.json");
-    const int rocksdb_increase_parallelism =
-        controller_enabled ? ctrl_high_bg_jobs : rocksdb_max_background_jobs;
+    int rocksdb_increase_parallelism = 
+        rocksdb_increase_parallelism_override ? rocksdb_increase_parallelism_override :
+        (controller_enabled ? ctrl_high_bg_jobs : rocksdb_max_background_jobs);
+
 
     std::cout << "[config] run_id=" << run_id
               << ", controller=" << (controller_enabled ? "on" : "off")
@@ -368,6 +415,9 @@ int main(int argc, char** argv) {
               << "[config] run_config_path=" << run_config_path.string() << "\n"
               << "[config][rocksdb] increase_parallelism="
               << rocksdb_increase_parallelism
+              << " ("
+              << (rocksdb_increase_parallelism_override > 0 ? "manual" : "auto")
+              << ")"
               << ", max_background_jobs=" << rocksdb_max_background_jobs
               << ", write_buffer_size_mb=" << rocksdb_write_buffer_size_mb
               << ", l0_compaction_trigger=" << rocksdb_l0_compaction_trigger
@@ -396,6 +446,9 @@ int main(int argc, char** argv) {
             << "  \"rocksdb\": {\n"
             << "    \"increase_parallelism\": " << rocksdb_increase_parallelism
             << ",\n"
+            << "    \"increase_parallelism_mode\": \""
+            << (rocksdb_increase_parallelism_override > 0 ? "manual" : "auto")
+            << "\",\n"
             << "    \"max_background_jobs\": " << rocksdb_max_background_jobs << ",\n"
             << "    \"write_buffer_size_mb\": " << rocksdb_write_buffer_size_mb
             << ",\n"
@@ -468,6 +521,7 @@ int main(int argc, char** argv) {
         ctrl_high_threshold,
         ctrl_low_bg_jobs,
         ctrl_high_bg_jobs,
+        rocksdb_max_background_jobs,
         ctrl_interval_sec,
         ctrl_cooldown_sec
     );

@@ -16,6 +16,7 @@ public:
                             int high_threshold,
                             int low_bg_jobs,
                             int high_bg_jobs,
+                            int current_bg_jobs,
                             int interval_sec,
                             int cooldown_sec)
         : db_(db),
@@ -26,7 +27,7 @@ public:
             high_bg_jobs_(high_bg_jobs),
             interval_sec_(interval_sec),
             cooldown_sec_(cooldown_sec),
-            current_bg_jobs_(-1),
+            current_bg_jobs_(current_bg_jobs),
             last_switch_tp_(std::chrono::steady_clock::now()) {}
 
     void Start() {
@@ -77,9 +78,6 @@ private:
     }
 
     int DecideTargetJobs(uint64_t l0, int current_jobs) const {
-        if (current_jobs < 0) {
-            return low_bg_jobs_;
-        }
         if (current_jobs != high_bg_jobs_ &&
             l0 >= static_cast<uint64_t>(high_threshold_)) {
             return high_bg_jobs_;
@@ -105,7 +103,7 @@ private:
                         << std::endl;
             auto now = std::chrono::steady_clock::now();
             bool cooldown_blocked =
-                (current_jobs >= 0 && target_jobs != current_jobs &&
+                (target_jobs != current_jobs &&
                  std::chrono::duration_cast<std::chrono::seconds>(
                      now - last_switch_tp_).count() < cooldown_sec_);
             if (cooldown_blocked) {
