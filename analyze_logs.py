@@ -1,34 +1,23 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 
 REQUIRED_COLUMNS = {
+    "phase_idx",
     "batch_latency_ms",
     "batch_payload_bytes",
     "stall_micros_total",
     "stall_micros_delta",
     "bg_jobs",
     "l0_files",
+    "process_cpu_user_sec",
+    "process_cpu_sys_sec",
 }
-
-
-def infer_config_name(path: Path) -> str:
-    stem = path.stem.lower()
-    if stem.startswith("fixed2"):
-        return "fixed2"
-    if stem.startswith("fixed4"):
-        return "fixed4"
-    if stem.startswith("fixed6"):
-        return "fixed6"
-    if stem.startswith("controller"):
-        return "controller"
-    return stem
-
 
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -47,19 +36,39 @@ def compute_overall_throughput_mb_s(df: pd.DataFrame) -> float:
     return total_payload_mb / (total_latency_ms / 1000.0)
 
 
-def compute_summary(config: str, df: pd.DataFrame) -> Dict[str, float]:
+def compute_cpu_totals(df: pd.DataFrame) -> Dict[str, float]:
+    user_total = float(df["process_cpu_user_sec"].max() - df["process_cpu_user_sec"].min())
+    sys_total = float(df["process_cpu_sys_sec"].max() - df["process_cpu_sys_sec"].min())
+    total = user_total + sys_total
+    return {
+        "cpu_user_sec": user_total,
+        "cpu_sys_sec": sys_total,
+        "cpu_total_sec": total,
+    }
+
+
+def compute_summary(file_label: str, df: pd.DataFrame) -> Dict[str, float]:
     lat = df["batch_latency_ms"]
     overall_tp = compute_overall_throughput_mb_s(df)
     stall_total_s = float(df["stall_micros_total"].max()) / 1e6
+    cpu = compute_cpu_totals(df)
+    total_payload_mb = float(df["batch_payload_bytes"].sum()) / (1024.0 * 1024.0)
+    cpu_sec_per_mb = np.nan
+    if total_payload_mb > 0.0:
+        cpu_sec_per_mb = cpu["cpu_total_sec"] / total_payload_mb
 
     return {
-        "config": config,
+        "file": file_label,
         "mean_latency_ms": float(lat.mean()),
         "p95_latency_ms": float(lat.quantile(0.95)),
         "p99_latency_ms": float(lat.quantile(0.99)),
         "max_latency_ms": float(lat.max()),
         "overall_throughput_mb_s": overall_tp,
         "total_stall_s": stall_total_s,
+        "process_cpu_user_sec": cpu["cpu_user_sec"],
+        "process_cpu_sys_sec": cpu["cpu_sys_sec"],
+        "process_cpu_total_sec": cpu["cpu_total_sec"],
+        "cpu_sec_per_mb": cpu_sec_per_mb,
         "rows": int(len(df)),
     }
 
@@ -74,18 +83,31 @@ def controller_switch_analysis(df: pd.DataFrame) -> pd.DataFrame:
     return switches[
         [
             "idx",
+            "phase_idx",
             "bg_jobs",
             "l0_files",
             "stall_micros_total",
             "batch_payload_bytes",
             "batch_latency_ms",
+            "process_cpu_user_sec",
+            "process_cpu_sys_sec",
         ]
     ]
 
 
 def controller_by_bg_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["cpu_total_delta_sec"] = (
+        d["process_cpu_user_sec"].diff().fillna(0.0) +
+        d["process_cpu_sys_sec"].diff().fillna(0.0)
+    ).clip(lower=0.0)
     rows = []
-    for bg_jobs, group in df.groupby("bg_jobs", dropna=False):
+    for bg_jobs, group in d.groupby("bg_jobs", dropna=False):
+        payload_mb = float(group["batch_payload_bytes"].sum()) / (1024.0 * 1024.0)
+        cpu_total_delta_sec = float(group["cpu_total_delta_sec"].sum())
+        cpu_sec_per_mb = np.nan
+        if payload_mb > 0.0:
+            cpu_sec_per_mb = cpu_total_delta_sec / payload_mb
         rows.append(
             {
                 "bg_jobs": bg_jobs,
@@ -96,6 +118,8 @@ def controller_by_bg_jobs(df: pd.DataFrame) -> pd.DataFrame:
                 "overall_throughput_mb_s": compute_overall_throughput_mb_s(group),
                 "mean_l0": float(group["l0_files"].mean()),
                 "stall_delta_sum_s": float(group["stall_micros_delta"].sum()) / 1e6,
+                "cpu_total_delta_sec": cpu_total_delta_sec,
+                "cpu_sec_per_mb": cpu_sec_per_mb,
             }
         )
     if not rows:
@@ -103,12 +127,12 @@ def controller_by_bg_jobs(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("bg_jobs")
 
 
-def compare_controller_vs_baselines(summary_df: pd.DataFrame) -> pd.DataFrame:
-    if "controller" not in set(summary_df["config"]):
+def compare_reference_vs_baselines(summary_df: pd.DataFrame, ref_file: str) -> pd.DataFrame:
+    if ref_file not in set(summary_df["file"]):
         return pd.DataFrame()
 
-    ctrl = summary_df[summary_df["config"] == "controller"].iloc[0]
-    baselines = summary_df[summary_df["config"] != "controller"].copy()
+    ref = summary_df[summary_df["file"] == ref_file].iloc[0]
+    baselines = summary_df[summary_df["file"] != ref_file].copy()
     if baselines.empty:
         return pd.DataFrame()
 
@@ -119,16 +143,18 @@ def compare_controller_vs_baselines(summary_df: pd.DataFrame) -> pd.DataFrame:
         "max_latency_ms",
         "overall_throughput_mb_s",
         "total_stall_s",
+        "process_cpu_total_sec",
+        "cpu_sec_per_mb",
     ]
 
     rows = []
     for _, row in baselines.iterrows():
-        out = {"baseline": row["config"]}
+        out = {"baseline_file": row["file"], "reference_file": ref_file}
         for m in metrics:
             if row[m] == 0:
                 out[m + "_delta_pct"] = np.nan
             else:
-                out[m + "_delta_pct"] = (ctrl[m] - row[m]) / row[m] * 100.0
+                out[m + "_delta_pct"] = (ref[m] - row[m]) / row[m] * 100.0
         rows.append(out)
     return pd.DataFrame(rows)
 
@@ -137,13 +163,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="分析 ClearCtrl logs/*.csv 指标")
     parser.add_argument(
         "csv_files",
-        nargs="*",
-        help="要分析的 CSV 文件；不传则默认读取 logs/*.csv",
-    )
-    parser.add_argument(
-        "--logs-dir",
-        default="logs",
-        help="默认扫描目录（当不传 csv_files 时生效）",
+        nargs="+",
+        help="要分析的 CSV 文件（必须显式传入；顺序约定：第一个是 controller/reference，其余是 baselines）",
     )
     parser.add_argument(
         "--out-dir",
@@ -152,24 +173,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.csv_files:
-        files = [Path(p) for p in args.csv_files]
-    else:
-        files = sorted(Path(args.logs_dir).glob("*.csv"))
+    files = [Path(p) for p in args.csv_files]
 
     if not files:
         raise SystemExit("未找到可分析的 CSV 文件。")
 
-    dfs: Dict[str, pd.DataFrame] = {}
+    datasets: List[Tuple[str, pd.DataFrame]] = []
+    name_count: Dict[str, int] = {}
     for p in files:
-        config = infer_config_name(p)
-        dfs[config] = load_csv(p)
+        label = p.name
+        count = name_count.get(label, 0)
+        name_count[label] = count + 1
+        if count > 0:
+            label = f"{label}#{count+1}"
+        datasets.append((label, load_csv(p)))
 
-    order = ["fixed2", "fixed4", "fixed6", "controller"]
-    summaries = [compute_summary(cfg, dfs[cfg]) for cfg in order if cfg in dfs]
-    for cfg in dfs:
-        if cfg not in order:
-            summaries.append(compute_summary(cfg, dfs[cfg]))
+    summaries = [compute_summary(label, df) for label, df in datasets]
 
     summary_df = pd.DataFrame(summaries)
     if summary_df.empty:
@@ -182,12 +201,14 @@ def main() -> None:
     summary_df.to_csv(summary_csv, index=False)
 
     print(f"[saved] {summary_csv}")
+    print(f"[info] reference(controller) file: {datasets[0][0]}")
 
-    if "controller" in dfs:
-        ctrl_df = dfs["controller"]
+    # By convention: first file is controller/reference, rest are baselines.
+    if datasets:
+        ctrl_label, ctrl_df = datasets[0]
         switch_df = controller_switch_analysis(ctrl_df)
         by_bg_df = controller_by_bg_jobs(ctrl_df)
-        cmp_df = compare_controller_vs_baselines(summary_df)
+        cmp_df = compare_reference_vs_baselines(summary_df, ctrl_label)
 
         if not switch_df.empty:
             switch_path = out_dir / "controller_switches.csv"

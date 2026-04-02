@@ -2,6 +2,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 
 #include "rocksdb/db.h"
@@ -10,10 +11,75 @@
 
 class CompactionController {
 public:
+    static constexpr int LOW_PRESSURE_CYCLES_REQUIRED = 10;
+    static inline bool TryGetUint64Property(rocksdb::DB* db,
+                                            const std::string& key,
+                                            uint64_t* value) {
+        std::string prop;
+        if (!db->GetProperty(key, &prop)) {
+            return false;
+        }
+        try {
+            *value = std::stoull(prop);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static inline uint64_t GetL0Files(rocksdb::DB* db) {
+        uint64_t l0_files = 0;
+        if (TryGetUint64Property(db, "rocksdb.num-files-at-level0", &l0_files)) {
+            return l0_files;
+        }
+        return 0;
+    }
+
+    static inline uint64_t GetCompactionPendingBytes(rocksdb::DB* db) {
+        uint64_t pending = 0;
+        if (TryGetUint64Property(
+                db, "rocksdb.estimate-pending-compaction-bytes", &pending)) {
+            return pending;
+        }
+        return 0;
+    }
+
+    static inline uint64_t GetIsWriteStopped(rocksdb::DB* db) {
+        uint64_t stopped = 0;
+        if (db->GetIntProperty("rocksdb.is-write-stopped", &stopped)) {
+            return stopped;
+        }
+        return 0;
+    }
+
+    static inline uint64_t GetActualDelayedWriteRate(rocksdb::DB* db) {
+        uint64_t rate = 0;
+        if (db->GetIntProperty("rocksdb.actual-delayed-write-rate", &rate)) {
+            return rate;
+        }
+        return 0;
+    }
+
+    static inline uint64_t GetNumRunningCompactions(rocksdb::DB* db) {
+        uint64_t running = 0;
+        if (db->GetIntProperty("rocksdb.num-running-compactions", &running)) {
+            return running;
+        }
+        return 0;
+    }
+
+    static inline uint64_t GetStallMicrosTotal(rocksdb::DB* db) {
+        uint64_t stall_micros = 0;
+        if (TryGetUint64Property(db, "rocksdb.stall-micros", &stall_micros)) {
+            return stall_micros;
+        }
+        return 0;
+    }
+
     CompactionController(rocksdb::DB* db,
                             std::atomic<bool>* stop_flag,
-                            int low_threshold,
-                            int high_threshold,
+                            int l0_compaction_trigger,
+                            int l0_slowdown_trigger,
                             int low_bg_jobs,
                             int high_bg_jobs,
                             int current_bg_jobs,
@@ -21,8 +87,8 @@ public:
                             int cooldown_sec)
         : db_(db),
             stop_flag_(stop_flag),
-            low_threshold_(low_threshold),
-            high_threshold_(high_threshold),
+            l0_compaction_trigger_(l0_compaction_trigger),
+            l0_slowdown_trigger_(l0_slowdown_trigger),
             low_bg_jobs_(low_bg_jobs),
             high_bg_jobs_(high_bg_jobs),
             interval_sec_(interval_sec),
@@ -45,17 +111,6 @@ public:
     }
 
 private:
-    uint64_t GetL0Files() {
-        std::string prop;
-        bool ok = db_->GetProperty("rocksdb.num-files-at-level0", &prop);
-        if (!ok) {
-            std::cerr << "[controller] failed to read property "
-                        << "rocksdb.num-files-at-level0" << std::endl;
-            return 0;
-        }
-        return std::stoull(prop);
-    }
-
     bool ApplyMaxBackgroundJobs(int jobs) {
         if (jobs == current_bg_jobs_) {
             return false;  // 避免重复设置
@@ -77,13 +132,37 @@ private:
         return true;
     }
 
-    int DecideTargetJobs(uint64_t l0, int current_jobs) const {
-        if (current_jobs != high_bg_jobs_ &&
-            l0 >= static_cast<uint64_t>(high_threshold_)) {
+    int DecideTargetJobs(uint64_t l0,
+                         uint64_t stall_micros_delta,
+                         uint64_t pending_bytes,
+                         uint64_t delayed_write_rate,
+                         uint64_t is_write_stopped,
+                         uint64_t num_running_compactions,
+                         int current_jobs) {
+        const bool should_scale_up =
+            (delayed_write_rate > 0 ||
+             is_write_stopped > 0 ||
+             stall_micros_delta > 0 ||
+             l0 > static_cast<uint64_t>(l0_slowdown_trigger_));
+
+        const bool low_pressure_now =
+            (stall_micros_delta == 0 &&
+             pending_bytes == 0 &&
+             num_running_compactions == 0 &&
+             delayed_write_rate == 0 &&
+             l0 < static_cast<uint64_t>(l0_compaction_trigger_));
+        if (low_pressure_now) {
+            ++low_pressure_streak_;
+        } else {
+            low_pressure_streak_ = 0;
+        }
+        const bool should_scale_down =
+            low_pressure_streak_ >= LOW_PRESSURE_CYCLES_REQUIRED;
+
+        if (current_jobs != high_bg_jobs_ && should_scale_up) {
             return high_bg_jobs_;
         }
-        if (current_jobs != low_bg_jobs_ &&
-            l0 <= static_cast<uint64_t>(low_threshold_)) {
+        if (current_jobs != low_bg_jobs_ && should_scale_down) {
             return low_bg_jobs_;
         }
         return current_jobs;
@@ -91,13 +170,35 @@ private:
 
     void Run() {
         while (!stop_flag_->load()) {
-            uint64_t l0 = GetL0Files();
+            uint64_t l0 = GetL0Files(db_);
+            uint64_t pending_bytes = GetCompactionPendingBytes(db_);
+            uint64_t is_write_stopped = GetIsWriteStopped(db_);
+            uint64_t delayed_write_rate = GetActualDelayedWriteRate(db_);
+            uint64_t num_running_compactions = GetNumRunningCompactions(db_);
+            uint64_t stall_micros_total = GetStallMicrosTotal(db_);
+            uint64_t stall_micros_delta =
+                stall_micros_total >= prev_stall_micros_
+                    ? (stall_micros_total - prev_stall_micros_)
+                    : 0;
+            prev_stall_micros_ = stall_micros_total;
             const int current_jobs = current_bg_jobs_.load();
-            int target_jobs = DecideTargetJobs(l0, current_jobs);
+            int target_jobs = DecideTargetJobs(l0,
+                                               stall_micros_delta,
+                                               pending_bytes,
+                                               delayed_write_rate,
+                                               is_write_stopped,
+                                               num_running_compactions,
+                                               current_jobs);
 
             std::cout << "[controller] L0 files=" << l0
-                        << ", low_threshold=" << low_threshold_
-                        << ", high_threshold=" << high_threshold_
+                        << ", l0_compaction_trigger=" << l0_compaction_trigger_
+                        << ", l0_slowdown_trigger=" << l0_slowdown_trigger_
+                        << ", stall_micros_delta=" << stall_micros_delta
+                        << ", pending_bytes=" << pending_bytes
+                        << ", delayed_rate=" << delayed_write_rate
+                        << ", is_write_stopped=" << is_write_stopped
+                        << ", num_running_compactions=" << num_running_compactions
+                        << ", low_pressure_streak=" << low_pressure_streak_
                         << ", current max_background_jobs=" << current_jobs
                         << ", target max_background_jobs=" << target_jobs
                         << std::endl;
@@ -124,12 +225,14 @@ private:
 private:
     rocksdb::DB* db_;
     std::atomic<bool>* stop_flag_;
-    int low_threshold_;
-    int high_threshold_;
+    int l0_compaction_trigger_;
+    int l0_slowdown_trigger_;
     int low_bg_jobs_;
     int high_bg_jobs_;
     int interval_sec_;
     int cooldown_sec_;
+    int low_pressure_streak_ = 0;
+    uint64_t prev_stall_micros_ = 0;
     std::atomic<int> current_bg_jobs_;
     std::chrono::steady_clock::time_point last_switch_tp_;
     std::thread worker_;
