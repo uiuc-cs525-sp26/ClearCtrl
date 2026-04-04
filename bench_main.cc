@@ -15,6 +15,7 @@
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/statistics.h"
 
 #include "compaction_controller.h"
 
@@ -23,7 +24,6 @@ using namespace ROCKSDB_NAMESPACE;
 static std::atomic<bool> g_stop{false};
 
 constexpr bool DEFAULT_CONTROLLER_ENABLED = true;
-constexpr uint64_t DEFAULT_ROUNDS = 0;
 constexpr uint64_t DEFAULT_RUNNER_SLEEP_MS = 100;
 constexpr uint64_t DEFAULT_RUNNER_BATCH_OPS = 4000;
 constexpr int DEFAULT_ROCKSDB_MAX_BACKGROUND_JOBS = 2;
@@ -49,13 +49,11 @@ void PrintUsage(const char* prog) {
         << "Runner options:\n"
         << "  --controller=on|off                 Enable/disable dynamic controller (default: "
         << (DEFAULT_CONTROLLER_ENABLED ? "on" : "off") << ")\n"
-        << "  --rounds=N                          Number of write rounds; 0 means run until Ctrl+C (default: "
-        << DEFAULT_ROUNDS << ")\n"
-        << "  --runner-sleep-ms=N                 Sleep interval between write rounds in ms (default: "
-        << DEFAULT_RUNNER_SLEEP_MS << ")\n"
-        << "  --runner-batch-ops=N                Number of Put ops per round (default: "
-        << DEFAULT_RUNNER_BATCH_OPS << ")\n"
-        << "  --runner-schedule=OPS:SLEEP:ROUNDS;...  Multi-phase workload schedule; \n"
+        << "  --runner-schedule=\"OPS:SLEEP:ROUNDS;...\"  Required multi-phase schedule. "
+           "Each phase can leave OPS or SLEEP empty to use defaults "
+           "(defaults: OPS="
+        << DEFAULT_RUNNER_BATCH_OPS << ", SLEEP=" << DEFAULT_RUNNER_SLEEP_MS
+        << "ms), e.g. \":100:300;8000::200\"\n"
         << "  --log-path=FILE                     Output CSV path (default: "
         << DEFAULT_LOG_PATH_PATTERN << ")\n"
         << "  --run-id=ID                         Explicit run id (default: auto timestamp)\n"
@@ -103,6 +101,8 @@ bool GetProcessCpuSeconds(double* user_sec, double* sys_sec) {
 }
 
 bool ParseRunnerSchedule(const std::string& spec,
+                         uint64_t default_batch_ops,
+                         uint64_t default_sleep_ms,
                          std::vector<WorkloadPhase>* phases,
                          std::string* error) {
     phases->clear();
@@ -129,8 +129,14 @@ bool ParseRunnerSchedule(const std::string& spec,
         const std::string rounds_str = segment.substr(p2 + 1);
         try {
             WorkloadPhase phase{};
-            phase.batch_ops = std::stoull(ops_str);
-            phase.sleep_ms = std::stoull(sleep_str);
+            phase.batch_ops =
+                ops_str.empty() ? default_batch_ops : std::stoull(ops_str);
+            phase.sleep_ms =
+                sleep_str.empty() ? default_sleep_ms : std::stoull(sleep_str);
+            if (rounds_str.empty()) {
+                *error = "rounds cannot be empty in phase: " + segment;
+                return false;
+            }
             phase.rounds = std::stoull(rounds_str);
             if (phase.batch_ops == 0 || phase.rounds == 0) {
                 *error = "batch_ops and rounds must be > 0 in phase: " + segment;
@@ -157,9 +163,6 @@ int main(int argc, char** argv) {
 
     const std::string DB_PATH = "./testdb";
     bool controller_enabled = DEFAULT_CONTROLLER_ENABLED;
-    uint64_t max_rounds = DEFAULT_ROUNDS;
-    uint64_t runner_sleep_ms = DEFAULT_RUNNER_SLEEP_MS;
-    uint64_t runner_batch_ops = DEFAULT_RUNNER_BATCH_OPS;
     std::string runner_schedule;
     std::string log_path;
     std::string run_id;
@@ -178,9 +181,6 @@ int main(int argc, char** argv) {
 
     enum OptionId {
         OPT_CONTROLLER = 1000,
-        OPT_ROUNDS,
-        OPT_RUNNER_SLEEP_MS,
-        OPT_RUNNER_BATCH_OPS,
         OPT_RUNNER_SCHEDULE,
         OPT_LOG_PATH,
         OPT_RUN_ID,
@@ -198,9 +198,6 @@ int main(int argc, char** argv) {
 
     static struct option long_options[] = {
         {"controller", required_argument, nullptr, OPT_CONTROLLER},
-        {"rounds", required_argument, nullptr, OPT_ROUNDS},
-        {"runner-sleep-ms", required_argument, nullptr, OPT_RUNNER_SLEEP_MS},
-        {"runner-batch-ops", required_argument, nullptr, OPT_RUNNER_BATCH_OPS},
         {"runner-schedule", required_argument, nullptr, OPT_RUNNER_SCHEDULE},
         {"log-path", required_argument, nullptr, OPT_LOG_PATH},
         {"run-id", required_argument, nullptr, OPT_RUN_ID},
@@ -260,27 +257,6 @@ int main(int argc, char** argv) {
                 }
                 break;
             }
-            case OPT_ROUNDS: {
-                if (!parse_u64_arg("--rounds", optarg, &max_rounds)) {
-                    PrintUsage(argv[0]);
-                    return 1;
-                }
-                break;
-            }
-            case OPT_RUNNER_SLEEP_MS:
-                if (!parse_u64_arg("--runner-sleep-ms", optarg,
-                                   &runner_sleep_ms)) {
-                    PrintUsage(argv[0]);
-                    return 1;
-                }
-                break;
-            case OPT_RUNNER_BATCH_OPS:
-                if (!parse_u64_arg("--runner-batch-ops", optarg,
-                                   &runner_batch_ops)) {
-                    PrintUsage(argv[0]);
-                    return 1;
-                }
-                break;
             case OPT_RUNNER_SCHEDULE:
                 runner_schedule = optarg;
                 break;
@@ -380,14 +356,19 @@ int main(int argc, char** argv) {
     if (log_path.empty()) {
         log_path = "logs/metrics_" + run_id + ".csv";
     }
+    if (runner_schedule.empty()) {
+        std::cerr << "Missing required --runner-schedule\n";
+        PrintUsage(argv[0]);
+        return 1;
+    }
     std::vector<WorkloadPhase> workload_phases;
-    if (!runner_schedule.empty()) {
-        std::string parse_error;
-        if (!ParseRunnerSchedule(runner_schedule, &workload_phases, &parse_error)) {
-            std::cerr << "Invalid --runner-schedule: " << parse_error << "\n";
-            PrintUsage(argv[0]);
-            return 1;
-        }
+    std::string parse_error;
+    if (!ParseRunnerSchedule(runner_schedule, DEFAULT_RUNNER_BATCH_OPS,
+                             DEFAULT_RUNNER_SLEEP_MS,
+                             &workload_phases, &parse_error)) {
+        std::cerr << "Invalid --runner-schedule: " << parse_error << "\n";
+        PrintUsage(argv[0]);
+        return 1;
     }
 
     std::filesystem::path log_file_path(log_path);
@@ -405,12 +386,16 @@ int main(int argc, char** argv) {
         rocksdb_increase_parallelism_override ? rocksdb_increase_parallelism_override :
         (controller_enabled ? ctrl_high_bg_jobs : rocksdb_max_background_jobs);
 
+    uint64_t rounds = 0;
+    for (const WorkloadPhase& phase : workload_phases) {
+        rounds += phase.rounds;
+    }
 
     std::cout << "[config] run_id=" << run_id
               << ", controller=" << (controller_enabled ? "on" : "off")
-              << ", rounds=" << max_rounds
-              << ", runner_sleep_ms=" << runner_sleep_ms
-              << ", runner_batch_ops=" << runner_batch_ops
+              << ", default_runner_sleep_ms=" << DEFAULT_RUNNER_SLEEP_MS
+              << ", default_runner_batch_ops=" << DEFAULT_RUNNER_BATCH_OPS
+              << ", rounds=" << rounds
               << ", runner_schedule="
               << (runner_schedule.empty() ? "<none>" : runner_schedule)
               << ", log_path=" << log_path << "\n"
@@ -438,9 +423,9 @@ int main(int argc, char** argv) {
             << "  \"runner\": {\n"
             << "    \"controller\": \"" << (controller_enabled ? "on" : "off")
             << "\",\n"
-            << "    \"rounds\": " << max_rounds << ",\n"
-            << "    \"sleep_ms\": " << runner_sleep_ms << ",\n"
-            << "    \"batch_ops\": " << runner_batch_ops << ",\n"
+            << "    \"default_sleep_ms\": " << DEFAULT_RUNNER_SLEEP_MS << ",\n"
+            << "    \"default_batch_ops\": " << DEFAULT_RUNNER_BATCH_OPS << ",\n"
+            << "    \"rounds\": " << rounds << ",\n"
             << "    \"schedule\": \"" << runner_schedule << "\",\n"
             << "    \"log_path\": \"" << log_path << "\"\n"
             << "  },\n"
@@ -475,6 +460,7 @@ int main(int argc, char** argv) {
     options.IncreaseParallelism(rocksdb_increase_parallelism);
     options.max_background_jobs = rocksdb_max_background_jobs;
     options.OptimizeLevelStyleCompaction();
+    options.statistics = rocksdb::CreateDBStatistics();
 
     // 关闭压缩
     options.compression = rocksdb::kNoCompression;
@@ -514,6 +500,7 @@ int main(int argc, char** argv) {
     // 控制器开关：on 为动态调参，off 为 baseline
     CompactionController ctl(
         db,
+        options.statistics,
         &g_stop,
         rocksdb_l0_compaction_trigger,
         rocksdb_l0_slowdown_trigger,
@@ -542,27 +529,18 @@ int main(int argc, char** argv) {
     size_t phase_idx = 0;
     uint64_t rounds_in_phase = 0;
     while (!g_stop.load()) {
-        uint64_t current_batch_ops = runner_batch_ops;
-        uint64_t current_sleep_ms = runner_sleep_ms;
-        uint64_t phase_idx_for_log = 0;
-        if (!workload_phases.empty()) {
-            if (phase_idx >= workload_phases.size()) {
-                break;
-            }
-            const WorkloadPhase& phase = workload_phases[phase_idx];
-            if (rounds_in_phase >= phase.rounds) {
-                ++phase_idx;
-                rounds_in_phase = 0;
-                continue;
-            }
-            current_batch_ops = phase.batch_ops;
-            current_sleep_ms = phase.sleep_ms;
-            phase_idx_for_log = static_cast<uint64_t>(phase_idx + 1);
-        } else {
-            if (max_rounds > 0 && rounds_done >= max_rounds) {
-                break;
-            }
+        if (phase_idx >= workload_phases.size()) {
+            break;
         }
+        const WorkloadPhase& phase = workload_phases[phase_idx];
+        if (rounds_in_phase >= phase.rounds) {
+            ++phase_idx;
+            rounds_in_phase = 0;
+            continue;
+        }
+        uint64_t current_batch_ops = phase.batch_ops;
+        uint64_t current_sleep_ms = phase.sleep_ms;
+        uint64_t phase_idx_for_log = static_cast<uint64_t>(phase_idx + 1);
         WriteBatch batch;
         size_t batch_payload_bytes = 0;
         for (uint64_t j = 0; j < current_batch_ops; ++j) {
@@ -581,7 +559,7 @@ int main(int argc, char** argv) {
         }
 
         uint64_t l0 = CompactionController::GetL0Files(db);
-        uint64_t stall_total = CompactionController::GetStallMicrosTotal(db);
+        uint64_t stall_total = CompactionController::GetStallMetric(options.statistics);
         uint64_t stall_delta = stall_total - prev_stall_micros;
         prev_stall_micros = stall_total;
         uint64_t pending_bytes = CompactionController::GetCompactionPendingBytes(db);
@@ -622,9 +600,7 @@ int main(int argc, char** argv) {
         }
 
         ++rounds_done;
-        if (!workload_phases.empty()) {
-            ++rounds_in_phase;
-        }
+        ++rounds_in_phase;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(current_sleep_ms));
     }

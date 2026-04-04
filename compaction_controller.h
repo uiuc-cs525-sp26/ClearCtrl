@@ -4,10 +4,12 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
+#include "rocksdb/statistics.h"
 
 class CompactionController {
 public:
@@ -68,15 +70,16 @@ public:
         return 0;
     }
 
-    static inline uint64_t GetStallMicrosTotal(rocksdb::DB* db) {
-        uint64_t stall_micros = 0;
-        if (TryGetUint64Property(db, "rocksdb.stall-micros", &stall_micros)) {
-            return stall_micros;
+    static inline uint64_t GetStallMetric(
+        const std::shared_ptr<rocksdb::Statistics>& statistics) {
+        if (!statistics) {
+            return 0;
         }
-        return 0;
+        return statistics->getTickerCount(rocksdb::STALL_MICROS);
     }
 
     CompactionController(rocksdb::DB* db,
+                            std::shared_ptr<rocksdb::Statistics> statistics,
                             std::atomic<bool>* stop_flag,
                             int l0_compaction_trigger,
                             int l0_slowdown_trigger,
@@ -86,6 +89,7 @@ public:
                             int interval_sec,
                             int cooldown_sec)
         : db_(db),
+            statistics_(std::move(statistics)),
             stop_flag_(stop_flag),
             l0_compaction_trigger_(l0_compaction_trigger),
             l0_slowdown_trigger_(l0_slowdown_trigger),
@@ -175,7 +179,7 @@ private:
             uint64_t is_write_stopped = GetIsWriteStopped(db_);
             uint64_t delayed_write_rate = GetActualDelayedWriteRate(db_);
             uint64_t num_running_compactions = GetNumRunningCompactions(db_);
-            uint64_t stall_micros_total = GetStallMicrosTotal(db_);
+            uint64_t stall_micros_total = GetStallMetric(statistics_);
             uint64_t stall_micros_delta =
                 stall_micros_total >= prev_stall_micros_
                     ? (stall_micros_total - prev_stall_micros_)
@@ -224,6 +228,7 @@ private:
 
 private:
     rocksdb::DB* db_;
+    std::shared_ptr<rocksdb::Statistics> statistics_;
     std::atomic<bool>* stop_flag_;
     int l0_compaction_trigger_;
     int l0_slowdown_trigger_;

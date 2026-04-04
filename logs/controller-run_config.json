@@ -1,10 +1,10 @@
 {
-  "run_id": "1775137273820",
+  "run_id": "1775330266959",
   "runner": {
     "controller": "on",
-    "rounds": 0,
-    "sleep_ms": 100,
-    "batch_ops": 4000,
+    "default_sleep_ms": 100,
+    "default_batch_ops": 4000,
+    "rounds": 900,
     "schedule": "1000:100:300;4000:100:300;500:100:300",
     "log_path": "logs/controller.csv"
   },
