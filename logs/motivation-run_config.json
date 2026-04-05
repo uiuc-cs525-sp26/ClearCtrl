@@ -1,0 +1,26 @@
+{
+  "run_id": "1775331719136",
+  "runner": {
+    "controller": "off",
+    "default_sleep_ms": 100,
+    "default_batch_ops": 4000,
+    "rounds": 1000,
+    "schedule": "10000:0:1000",
+    "log_path": "logs/motivation.csv"
+  },
+  "rocksdb": {
+    "increase_parallelism": 1,
+    "increase_parallelism_mode": "auto",
+    "max_background_jobs": 1,
+    "write_buffer_size_mb": 1,
+    "l0_compaction_trigger": 8,
+    "l0_slowdown_trigger": 12,
+    "l0_stop_trigger": 16
+  },
+  "clearctrl": {
+    "low_bg_jobs": 2,
+    "high_bg_jobs": 6,
+    "interval_sec": 2,
+    "cooldown_sec": 6
+  }
+}
